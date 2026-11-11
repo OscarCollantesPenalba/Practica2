@@ -1,0 +1,358 @@
+from src.modelo.comun import config
+from src.modelo.comun.calidad import (nulos_por_columna, integridad_estrella, perfil_precios, perfil_sentimiento)
+from src.modelo.comun.spark_session import get_spark_session
+from src.modelo.io.parquet_io import contar_filas, escribir_parquet, leer_parquet
+from src.modelo.io.delta_io import contar_filas_delta, escribir_delta, leer_delta, version_actual
+from src.modelo.bronze.precios import descargar_historico, descargar_ibex
+from src.modelo.bronze.sentimiento import leer_csv_sentimiento
+from src.modelo.bronze.empresas import descargar_info_empresas
+from src.modelo.bronze.exploracion_api import tablas_yahoo, info_yahoo
+from src.modelo.bronze.delta_ops import (borrar_filas, con_close_mas5, convertir_a_delta,
+                                         historial, intentar_escribir_delta, leer_delta_version,
+                                         merge_insertar_nuevos, restaurar_version, version_de_operacion)
+from src.modelo.silver.sentimiento import limpiar_sentimiento
+from src.modelo.silver.precios import limpiar_precios
+from src.modelo.silver.empresas import limpiar_empresas
+from src.modelo.gold.hecho import construir_hecho
+from src.modelo.gold.dimensiones import construir_dim_empresa, construir_dim_fecha
+from src.modelo.gold.indicadores import anadir_indicadores
+from src.modelo.gold.cruce import (precios_sin_sentimiento,sentimiento_sin_precios, resumen_por_sector)
+from src.modelo.gold.exportacion import exportar_parquet
+from src.vista.ibex_view import IbexView
+
+# Ejercicios implementados, en orden de ejecución.
+EJERCICIOS = ["ej1a", "ej1b", "ej1c", "ej2a", "ej2b", "ej2c", "ej3", "ej4", "ej5a", "ej5b", "ej5c", "ej5d", "ej6", "ej7", "ej8", "ej9", "ej10", "ej11", "ej12", "ej13"]
+
+class IbexController:
+    """Orquesta los ejercicios: llama a funciones del modelo y se las pasa a la vista.
+    La lógica vive en src/modelo; aquí solo se encadenan llamadas y se muestran resultados."""
+
+    def __init__(self):
+        self.spark = get_spark_session()
+        self.view = IbexView()
+
+    def run(self, ejercicios=None):
+        for nombre in (ejercicios or EJERCICIOS):
+            getattr(self, nombre.lower())()
+        self.spark.stop()
+
+#========================================================================================
+#===================CLASE 1 - Capa bronze ===============================================
+#========================================================================================
+
+    def ej1a(self):
+        # Ej1a
+        self.view.titulo("Ej1a")
+        # Una sola acción (BBVA) para comprobar la función; los nulos están definidos 
+        # y justificados columna a columna en ESQUEMA_PRECIOS.
+        df = descargar_historico(self.spark, "BBVA.MC", config.INICIO, config.FIN)
+        self.view.esquema(df)
+
+    def ej1b(self):
+        # Ej1b
+        self.view.titulo("Ej1b")
+        df = descargar_ibex(self.spark, config.TICKERS_IBEX, config.INICIO, config.FIN)
+        escribir_parquet(df, config.BRONZE_IBEX, "overwrite")
+
+    def ej1c(self):
+        # Ej1c (opcional)   
+        self.view.titulo("Ej1c")
+        df = leer_parquet(self.spark, config.BRONZE_IBEX)
+        self.view.esquema(df)
+        self.view.filas(df, 5)
+        # Column pruning: solo se leen 3 de las 9 columnas
+        self.view.filas(leer_parquet(self.spark, config.BRONZE_IBEX, ["Ticker", "Date", "Close"]), 5)
+        self.view.mensaje("Comentario: Parquet guarda cada columna en su propio bloque (column chunk). "
+                          "Al pedir solo Ticker, Date y Close, Spark lee únicamente esos 3 bloques y se "
+                          "salta Open, High, Low, Volume, Dividends y Stock_Splits: menos lectura de disco "
+                          "y menos memoria. Con un CSV habría que leer todas las filas completas.")
+
+    def ej2a(self):
+        # Ej2a
+        self.view.titulo("Ej2a")
+        df = leer_csv_sentimiento(self.spark)
+        self.view.esquema(df)
+        self.view.filas(df, 5)
+        self.view.mensaje("Comentario: todas las columnas llegan como string porque un CSV es texto "
+                          "plano y no guarda tipos.")
+
+    def ej2b(self):
+        # Ej2b
+        self.view.titulo("Ej2b")
+        df = leer_csv_sentimiento(self.spark)
+        self.view.valor("Filas leídas del CSV", df.count())
+        escribir_parquet(df, config.BRONZE_SENTIMIENTO, "overwrite")
+        self.view.valor("Filas escritas en bronze/sentimiento",contar_filas(self.spark, config.BRONZE_SENTIMIENTO))
+
+    def ej2c(self):
+        # Ej2c (opcional)
+        self.view.titulo("Ej2c")
+        df = leer_csv_sentimiento(self.spark)
+        self.view.valor("Filas antes del append", contar_filas(self.spark, config.BRONZE_SENTIMIENTO))
+        escribir_parquet(df, config.BRONZE_SENTIMIENTO, "append")
+        self.view.valor("Filas después del append", contar_filas(self.spark, config.BRONZE_SENTIMIENTO))
+        self.view.mensaje("Comentario: Parquet es inmutable, así que append solo añade ficheros nuevos "
+                          "sin comprobar nada: cada fila del CSV queda duplicada. No hay clave ni "
+                          "transacciones, por eso la carga no es idempotente (Delta lo resuelve con MERGE).")
+        
+        # Se deshace el duplicado para que el Ej3 parta de un bronze correcto
+        escribir_parquet(df, config.BRONZE_SENTIMIENTO, "overwrite")
+
+#========================================================================================
+#===================CLASE 2 - Delta Lake sobre bronze ===================================
+#========================================================================================
+
+    def ej3(self):
+        # Ej3
+        self.view.titulo("Ej3")
+        for nombre, ruta in [("bronze/ibex", config.BRONZE_IBEX), ("bronze/sentimiento", config.BRONZE_SENTIMIENTO)]:
+            convertir_a_delta(self.spark, ruta)
+            self.view.valor("Tabla Delta", nombre)
+            h = historial(self.spark, ruta).select("version", "operation", "operationMetrics")
+            self.view.filas(h, 5, False)
+        self.view.mensaje("Comentario: ha aparecido la carpeta _delta_log con el commit de la versión 0 "
+                          "Los ficheros Parquet de datosno se han tocado: solo se han registrado en el "
+                          "log. A partir de ahora cada cambio añadirá un JSON nuevo, y recorrerlos permite"
+                          "reconstruir el estado de la tabla o volver a una versión anterior.")
+
+    def ej4(self):
+        # Ej4
+        self.view.titulo("Ej4")
+        ruta = config.BRONZE_IBEX
+        self.view.valor("Versión actual de bronze/ibex", version_actual(self.spark, ruta))
+        self.view.valor("Filas actuales de bronze/ibex", contar_filas_delta(self.spark, ruta))
+        # Se vuelve a descargar todo el periodo hasta hoy; MERGE decide qué entra
+        nuevos = descargar_ibex(self.spark, config.TICKERS_IBEX, config.INICIO, config.hoy())
+        for ejecucion in (1, 2):
+            antes = contar_filas_delta(self.spark, ruta)
+            merge_insertar_nuevos(self.spark, ruta, nuevos)
+            despues = contar_filas_delta(self.spark, ruta)
+            self.view.valor(f"MERGE {ejecucion}: filas antes / después / insertadas", f"{antes} / {despues} / {despues - antes}")
+            self.view.valor(f"MERGE {ejecucion}: versión de la tabla", version_actual(self.spark, ruta))
+            self.view.mensaje("Comentario: MERGE compara cada fila descargada con la tabla por la clave "
+                          "(Ticker, Date) e inserta solo las que no existen. La primera vez entran los días "
+                          "nuevos; la segunda no hay nada que insertar, así que cargar dos veces no "
+                          "duplica datos (con append sí se duplicarían).")
+
+    def ej5a(self):
+        # Ej5a
+        # Herramienta IA usada: Claude
+        self.view.titulo("Ej5a")
+        ruta = config.BRONZE_IBEX
+        df_nuevo = con_close_mas5(leer_delta(self.spark, ruta))
+        self.view.valor("Versión / filas antes", f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)}")
+        error = intentar_escribir_delta(df_nuevo, ruta, "append")
+        self.view.valor("Error de Delta", error)
+        self.view.valor("Versión / filas después", f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)}")
+        self.view.mensaje("Comentario: Delta valida el esquema al escribir (schema enforcement): el "
+                          "DataFrame trae una columna, Close_mas5, que la tabla no tiene, así que rechaza "
+                          "el append y la tabla queda intacta (misma versión y mismas filas).")
+
+    def ej5b(self):
+        # Ej5b
+        self.view.titulo("Ej5b")
+        ruta = config.BRONZE_IBEX
+        df_nuevo = con_close_mas5(leer_delta(self.spark, ruta))
+        self.view.valor("Versión / filas antes", f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)}")
+        error = intentar_escribir_delta(df_nuevo, ruta, "append", merge_schema=True)
+        self.view.valor("Error de Delta (None si la acepta)", error)
+        self.view.valor("Versión / filas después", f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)}")
+        self.view.esquema(leer_delta(self.spark, ruta))
+        self.view.mensaje("Comentario: con mergeSchema=true Delta acepta la escritura y añade Close_mas5 al esquema")
+        
+    def ej5c(self):
+        # Ej5c
+        self.view.titulo("Ej5c")
+        ruta = config.BRONZE_IBEX
+        condicion = "Ticker = 'BBVA.MC'"
+        self.view.valor("Filas de BBVA.MC antes del DELETE", contar_filas_delta(self.spark, ruta, condicion))
+        self.view.filas(leer_delta(self.spark, ruta, condicion), 5)
+        borrar_filas(self.spark, ruta, condicion)
+        self.view.valor("Filas de BBVA.MC después del DELETE", contar_filas_delta(self.spark, ruta, condicion))
+        self.view.filas(leer_delta(self.spark, ruta, condicion), 5)
+        self.view.mensaje("Comentario: DELETE borra solo las filas que cumplen la condición y crea una "
+                          "versión nueva en el log. Los ficheros no se eliminan del disco hasta un VACUUM, "
+                          "por eso el time travel todavía puede recuperar esas filas.")
+
+    def ej5d(self):
+        # Ej5d
+        self.view.titulo("Ej5d")
+        ruta = config.BRONZE_IBEX
+        self.view.filas(historial(self.spark, ruta).select("version", "operation"), 10, False)
+        antigua = leer_delta_version(self.spark, ruta, 1)
+        actual = leer_delta(self.spark, ruta)
+        self.view.valor("versionAsOf 1: filas / columnas", f"{antigua.count()} / {len(antigua.columns)}")
+        self.view.valor("Tabla actual: filas / columnas", f"{actual.count()} / {len(actual.columns)}")
+        self.view.mensaje("Comentario: no está todo igual. La versión antigua es la del Ej4 (sin Close_mas5, "
+                          "sin duplicados y con BBVA); la actual tiene una columna más, filas duplicadas por "
+                          "el Ej5b y no tiene BBVA por el Ej5c. versionAsOf solo lee: la tabla actual no cambia")
+        
+    def ej6(self):
+        # Ej6
+        self.view.titulo("Ej6")
+        ruta = config.BRONZE_IBEX
+        version = version_de_operacion(self.spark, ruta, "MERGE") or 0   
+        self.view.valor("Antes del RESTORE: versión / filas / columnas",
+                        f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)} / {len(leer_delta(self.spark, ruta).columns)}")
+        restaurar_version(self.spark, ruta, version)
+        self.view.valor(f"Después del RESTORE a la versión {version}: versión / filas / columnas",
+                        f"{version_actual(self.spark, ruta)} / {contar_filas_delta(self.spark, ruta)} / {len(leer_delta(self.spark, ruta).columns)}")
+        self.view.filas(historial(self.spark, ruta).select("version", "operation"), 10, False)
+
+#========================================================================================
+#===================CLASE 3 - Capas silver y gold =======================================
+#========================================================================================
+
+    def ej7(self):
+        # Ej7
+        self.view.titulo("Ej7")
+        precios = leer_delta(self.spark, config.BRONZE_IBEX)
+        sentimiento = leer_delta(self.spark, config.BRONZE_SENTIMIENTO)
+
+        self.view.seccion("Precios (bronze/ibex)")
+        self.view.esquema(precios)
+        self.view.filas(precios, 5)
+        for etiqueta, valor in perfil_precios(precios).items():
+            self.view.valor(etiqueta, valor)
+
+        self.view.seccion("Sentimiento (bronze/sentimiento)")
+        self.view.esquema(sentimiento)
+        self.view.filas(sentimiento, 5)
+        for etiqueta, valor in perfil_sentimiento(sentimiento).items():
+            self.view.valor(etiqueta, valor)
+        self.view.filas(sentimiento.groupBy("Sector").count().orderBy("Sector"), 40, False)
+
+        self.view.seccion("Datos que ofrece Yahoo Finance (BBVA.MC)")
+        for campo, valor in info_yahoo("BBVA.MC").items():
+            self.view.valor(f"  {campo}", valor)
+        for nombre, descripcion in tablas_yahoo("BBVA.MC").items():
+            self.view.valor(f"  {nombre}", descripcion)
+        self.view.mensaje("Comentario: la reflexión sobre cómo incorporar la información del experto con "
+                          "estos datos está en el PDF.")
+
+    def ej8(self):
+        # Ej8
+        self.view.titulo("Ej8")
+        bronce = leer_delta(self.spark, config.BRONZE_SENTIMIENTO)
+        escribir_delta(limpiar_sentimiento(bronce), config.SILVER_SENTIMIENTO, "overwrite")
+        plata = leer_delta(self.spark, config.SILVER_SENTIMIENTO)
+        self.view.esquema(plata)
+        self.view.filas(plata.orderBy("Fecha", "Sector"), 5)
+        self.view.valor("Filas de bronze/sentimiento", contar_filas_delta(self.spark, config.BRONZE_SENTIMIENTO))
+        self.view.valor("Filas de silver/sentimiento", contar_filas_delta(self.spark, config.SILVER_SENTIMIENTO))
+        self.view.filas(plata.groupBy("Sector").count().orderBy("Sector"), 20, False)
+        self.view.mensaje("Comentario: Fecha pasa a date, Sentimiento a double y Sector se normaliza "
+                          "(espacios y mayúscula inicial) para cruzarlo con el sector de Yahoo. "
+                          "Se quitan nulos y duplicados por (Fecha, Sector).")
+
+    def ej9(self):
+        # Ej9
+        self.view.titulo("Ej9")
+        # Precios: bronze -> silver
+        precios_bronce = leer_delta(self.spark, config.BRONZE_IBEX)
+        escribir_delta(limpiar_precios(precios_bronce), config.SILVER_IBEX, "overwrite", overwrite_schema=True)
+        precios = leer_delta(self.spark, config.SILVER_IBEX)
+        # Dimensión de empresas: Yahoo -> bronze (crudo) -> silver (corregido)
+        escribir_delta(descargar_info_empresas(self.spark, config.TICKERS_IBEX), config.BRONZE_EMPRESAS, "overwrite", overwrite_schema=True)
+        empresas_bronce = leer_delta(self.spark, config.BRONZE_EMPRESAS)
+        escribir_delta(limpiar_empresas(empresas_bronce), config.SILVER_EMPRESAS, "overwrite", overwrite_schema=True)
+        empresas = leer_delta(self.spark, config.SILVER_EMPRESAS)
+
+        self.view.seccion("silver/ibex")
+        self.view.esquema(precios)
+        self.view.filas(precios.orderBy("Ticker", "Fecha"), 5)
+        self.view.seccion("silver/empresas")
+        self.view.esquema(empresas)
+        self.view.filas(empresas.select("Ticker", "Nombre", "Sector", "Sector_ES", "Industria", "Pais").orderBy("Ticker"), 5)
+        self.view.valor("Filas de bronze/ibex / silver/ibex", f"{precios_bronce.count()} / {precios.count()}")
+        self.view.mensaje("Comentario: en silver/ibex se renombra Date a Fecha, se redondean los precios a 4 "
+                          "decimales y se descartan sesiones incoherentes y duplicados. El sector viene del "
+                          "objeto info de Yahoo: bronze/empresas lo guarda en crudo y silver/empresas lo limpia "
+                          "y añade el sector en español.")
+
+    def ej10(self):
+        # Ej10
+        self.view.titulo("Ej10")
+        precios = leer_delta(self.spark, config.SILVER_IBEX)
+        empresas = leer_delta(self.spark, config.SILVER_EMPRESAS)
+        sentimiento = leer_delta(self.spark, config.SILVER_SENTIMIENTO)
+        # Hecho: precios + sector de la empresa + sentimiento de ese sector y día
+        escribir_delta(construir_hecho(precios, empresas, sentimiento), config.GOLD_HECHO, "overwrite", overwrite_schema=True)
+        hecho = leer_delta(self.spark, config.GOLD_HECHO)
+        # Dimensiones: empresa y fecha (calendario de los días con cotización)
+        escribir_delta(construir_dim_empresa(empresas), config.GOLD_DIM_EMPRESA, "overwrite", overwrite_schema=True)
+        escribir_delta(construir_dim_fecha(hecho), config.GOLD_DIM_FECHA, "overwrite", overwrite_schema=True)
+
+        self.view.valor("Filas de silver/ibex / gold/hecho_cotizacion",
+                        f"{contar_filas_delta(self.spark, config.SILVER_IBEX)} / {contar_filas_delta(self.spark, config.GOLD_HECHO)}")
+        self.view.valor("Filas de gold/dim_empresa / gold/dim_fecha",
+                        f"{contar_filas_delta(self.spark, config.GOLD_DIM_EMPRESA)} / {contar_filas_delta(self.spark, config.GOLD_DIM_FECHA)}")
+        self.view.esquema(hecho)
+        self.view.filas(hecho.orderBy("Ticker", "Fecha"), 5)
+        self.view.mensaje("Comentario: modelo en estrella. El hecho tiene una fila por empresa y día; "
+                          "dim_empresa y dim_fecha aportan los atributos para filtrar y agrupar. "
+                          "El left join conserva todas las cotizaciones (sin sentimiento queda nulo).")
+        
+    def ej11(self):
+        # Ej11 (opcional)
+        self.view.titulo("Ej11")
+        precios = leer_delta(self.spark, config.SILVER_IBEX)
+        empresas = leer_delta(self.spark, config.SILVER_EMPRESAS)
+        sentimiento = leer_delta(self.spark, config.SILVER_SENTIMIENTO)
+
+        self.view.seccion("(a) Cotizaciones sin sentimiento")
+        a = precios_sin_sentimiento(precios, empresas, sentimiento)
+        self.view.valor("Filas", a.count())
+        self.view.filas(a.orderBy("Fecha", "Ticker"), 5)
+        self.view.filas(resumen_por_sector(a), 20, False)
+
+        self.view.seccion("(b) Sentimiento sin cotizaciones")
+        b = sentimiento_sin_precios(precios, empresas, sentimiento)
+        self.view.valor("Filas", b.count())
+        self.view.filas(b.orderBy("Fecha", "Sector"), 5)
+        self.view.filas(resumen_por_sector(b), 20, False)
+        self.view.mensaje("Comentario: (a) las cotizaciones sin sentimiento son posteriores al 30/09/2026, "
+                          "fin del CSV. (b) El sentimiento sin precios es anterior a octubre de 2024 o del "
+                          "sector Crypto, que no tiene empresas en el IBEX. Solución: no se pierde nada, el "
+                          "left join del Ej10 deja el sentimiento nulo y no se rellenan los huecos para no "
+                          "inventar la opinión del experto.")
+
+    def ej12(self):
+        # Ej12 (opcional)
+        self.view.titulo("Ej12")
+        con_indicadores = anadir_indicadores(leer_delta(self.spark, config.GOLD_HECHO))
+        escribir_delta(con_indicadores, config.GOLD_HECHO, "overwrite", overwrite_schema=True)
+        hecho = leer_delta(self.spark, config.GOLD_HECHO)
+        self.view.esquema(hecho)
+        self.view.valor("Nulos por columna", nulos_por_columna(hecho))
+        muestra = (hecho.filter("Ticker = 'BBVA.MC' AND Fecha >= '2026-11-01'").orderBy("Fecha")
+                   .select("Fecha", "Close", "Variacion_Diaria_Pct", "Rango_Intradia_Pct",
+                           "Variacion_Acumulada_Pct", "Media_Movil_20"))
+        self.view.filas(muestra, 5)
+        self.view.mensaje("Comentario: se añaden al hecho, por empresa y en orden de fecha, la variación "
+                          "diaria, el rango intradía, la variación acumulada y la media móvil de 20 sesiones. "
+                          "Se guarda como una versión nueva de Delta.")
+
+    def ej13(self):
+        # Ej13
+        # Herramienta IA usada: Claude
+            
+        self.view.titulo("Ej13")
+        hecho = leer_delta(self.spark, config.GOLD_HECHO)
+        dim_empresa = leer_delta(self.spark, config.GOLD_DIM_EMPRESA)
+        dim_fecha = leer_delta(self.spark, config.GOLD_DIM_FECHA)
+        # Antes de exportar se comprueba que la estrella es consistente (todo debe ser 0)
+        for etiqueta, valor in integridad_estrella(hecho, dim_empresa, dim_fecha).items():
+            self.view.valor(etiqueta, valor)
+        tablas = [("hecho_cotizacion", hecho, ["Ticker", "Fecha"]),
+                  ("dim_empresa", dim_empresa, ["Ticker"]),
+                  ("dim_fecha", dim_fecha, ["Fecha"])]
+        for nombre, df, orden in tablas:
+            ruta = (config.EXPORT_GOLD_DIR / nombre).as_posix()
+            exportar_parquet(df, ruta, orden)
+            self.view.valor(f"{nombre}: filas en gold / exportadas",
+                            f"{df.count()} / {self.spark.read.parquet(ruta).count()}")
+        self.view.esquema(self.spark.read.parquet((config.EXPORT_GOLD_DIR / "hecho_cotizacion").as_posix()))
+        self.view.mensaje("Comentario: se exportan las tres tablas de la estrella a data/export/gold, un único "
+                          "fichero Parquet por tabla, ordenado por su clave y con tipos simples que Power BI "
+                          "lee sin conversiones. Antes se comprueba que no hay claves huérfanas ni repetidas.")

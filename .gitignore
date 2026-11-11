@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.env
+spark-warehouse/
+data/spark-warehouse/
+metastore_db/
+derby.log
+# El data lake se regenera ejecutando el proyecto (python main.py)
+data/lake/
+# La gold exportada SÍ se versiona: es la fuente del dashboard de Power BI (Práctica 2)
+# y así el .pbix se puede actualizar en cualquier ordenador sin ejecutar Spark.
+# Se excluyen solo los ficheros auxiliares que escribe Spark.
+data/export/**/*.crc
+data/export/**/_SUCCESS
+# Copias temporales y de seguridad de Power BI
+powerbi/*.pbix.bak
+powerbi/~$*
